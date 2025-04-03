@@ -1,0 +1,1226 @@
+---
+title: "Neighbourhood School Accessability in Los Angeles"
+author: "Kyle Vavasour"
+output: html_document
+date: "2024-12-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(geoR)
+library(leaflet)
+library(units)
+library(spdep)
+library(kableExtra)
+library(leaflet.extras)
+library(spatialreg)
+library(htmlwidgets)
+library(htmltools)
+```
+
+```{r results='hide'}
+# import neighborhood, school, and demographic data
+nb <- st_read("./Neighborhoods/geo_export_5311b42f-ad07-4c36-8137-56a99a6951f3.shp")
+schools <- read.csv("./Schools_Colleges_and_Universities_5851199037199329399.csv")
+demographics <- read.csv("./Census_Data_by_Neighborhood_Council_20241103.csv")
+
+# join demographics with neighborhood
+nb <- nb %>%
+  left_join(demographics, by=c("name" = "NC_Name"))
+
+#filter to only public schools
+schools <- schools %>%
+  filter(Category3=="Public Schools")
+```
+
+```{r}
+# convert data to spatial with LA CRS projection
+schools <- st_as_sf(schools,
+                    coords=c("Longitude", "Latitude"),
+                    crs=4326,
+                    remove=TRUE)
+schools <- st_transform(schools, 32610)
+utm_nb <- st_transform(nb, 32610)
+```
+
+```{r}
+# define grid for school heat map
+coords <- st_coordinates(schools)
+bounds <- st_coordinates(utm_nb)
+
+# grid for visualization 1km spacing
+x_range1 <- seq(min(bounds[,1]), max(bounds[,1]), by = 1000)
+y_range1 <- seq(min(bounds[,2]), max(bounds[,2]), by = 1000)
+grid1 <- expand.grid(x = x_range1, y = y_range1)
+
+# grid for calculation 100m spacing
+x_range2 <- seq(min(bounds[,1]), max(bounds[,1]), by = 500)
+y_range2 <- seq(min(bounds[,2]), max(bounds[,2]), by = 500)
+grid2 <- expand.grid(x = x_range2, y = y_range2)
+```
+
+```{r}
+# distance from each grid point to closest school
+grid1$distance <- apply(grid1, 1, function(point) {
+  min(sqrt((point["x"] - coords[,1])^2 + (point["y"] - coords[,2])^2))
+})
+
+grid2$distance <- apply(grid2, 1, function(point) {
+  min(sqrt((point["x"] - coords[,1])^2 + (point["y"] - coords[,2])^2))
+})
+```
+
+```{r}
+# convert CRS and join only on neighborhoods
+grid1_sf <- st_as_sf(grid1,
+                    coords=c("x", "y"),
+                    crs=32610,
+                    remove=TRUE)
+grid1_sf <- st_join(grid1_sf, utm_nb, join=st_within)
+grid1_sf <- grid1_sf %>% filter(name %in% utm_nb$name)
+grid1_sf <- st_transform(grid1_sf, 4326)
+
+grid2_sf <- st_as_sf(grid2,
+                    coords=c("x", "y"),
+                    crs=32610,
+                    remove=TRUE)
+grid2_sf <- st_join(grid2_sf, utm_nb, join=st_within)
+grid2_sf <- grid2_sf %>% filter(name %in% utm_nb$name)
+grid2_sf <- st_transform(grid2_sf, 4326)
+```
+
+```{r}
+# average per neighbourhood
+dist_metric <- grid2_sf %>% 
+  st_drop_geometry() %>%
+  group_by(name) %>%
+  summarise(avg_dist = mean(distance))
+
+nb_dists <- nb %>% 
+  left_join(dist_metric, by='name')
+
+nb_dists$walkable <- nb_dists$avg_dist <= 1000
+```
+
+```{r}
+# make valid geometry
+data <- st_make_valid(nb_dists)
+coords <- st_coordinates(st_centroid(st_geometry(data)))
+```
+
+```{r}
+# different adjacency matrices
+queen_neighbors <- poly2nb(data, queen = TRUE)
+rook_neighbors <- poly2nb(data, queen = FALSE)
+knn2_neighbors <- knn2nb(knearneigh(coords, k = 2))
+knn4_neighbors <- knn2nb(knearneigh(coords, k = 4))
+knn6_neighbors <- knn2nb(knearneigh(coords, k = 6))
+knn8_neighbors <- knn2nb(knearneigh(coords, k = 8))
+```
+
+```{r}
+# adjacency weights
+queen_weights <- nb2listw(queen_neighbors, style = "W", zero.policy=TRUE)
+rook_weights <- nb2listw(rook_neighbors, style = "W", zero.policy=TRUE)
+knn2_weights <- nb2listw(knn2_neighbors, style = "W", zero.policy=TRUE)
+knn4_weights <- nb2listw(knn4_neighbors, style = "W", zero.policy=TRUE)
+knn6_weights <- nb2listw(knn6_neighbors, style = "W", zero.policy=TRUE)
+knn8_weights <- nb2listw(knn8_neighbors, style = "W", zero.policy=TRUE)
+```
+
+```{r}
+# correlograms
+moran_queen <- sp.correlogram(queen_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE, zero.policy=TRUE)
+moran_rook <- sp.correlogram(rook_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE,zero.policy=TRUE)
+moran_knn2 <- sp.correlogram(knn2_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE,zero.policy=TRUE)
+moran_knn4 <- sp.correlogram(knn4_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE,zero.policy=TRUE)
+moran_knn6 <- sp.correlogram(knn6_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE,zero.policy=TRUE)
+moran_knn8 <- sp.correlogram(knn8_neighbors, data$avg_dist, order = 10, method = "I", style = "W", randomisation=FALSE,zero.policy=TRUE)
+```
+
+## Introduction
+
+### Motivation
+
+Accessibility of schools is an import factor to consider in urban planning and can have implications on school children well-being, community connection, and environmental sustainability. For cities or other urban areas, providing accessible schools within walking distance of residential neighborhoods encourages physical activity and can minimizes traffic congestion or air pollution from car commutes. However, school accessibility is not always equitable, potentially leading to disparities in educational opportunities for low-income families who may lack reliable transportation options.
+
+"Walkable cities" are an increasingly popular idea, where essential services are reachable within a short walk or bike ride. Among these essential services are schools where walkable access could be a major benefit to parents, children, and the broader community. However, in some neighborhoods, children may have limited or no access to schools within a walkable distance.
+
+The goal of this study is to assess the walkability of schools across Los Angeles (LA), examining whether schools are equally accessible across neighborhoods with different socioeconomic characteristics. By visualizing school locations, defining walkable zones, and comparing neighborhood demographics, this project will identify potential disparities in access to schools and highlight areas where school accessibility could be improved.
+
+### Research Question
+
+The project will seek to answer the research question,
+
+Are public schools equitably accessible across neighborhoods with different socioeconomic demographics in LA?
+
+## Methods
+
+The methods section includes subsections corresponding to how the data was obtained, how the data was cleaned and processed for analysis, methods used in data exploration, methods for the hotspot analysis, and methods for the regression analysis.
+
+### Data Aquisition
+
+Multiple data sets were acquired for use in the project. The following data sets
+were downloaded:
+
+-LA Neighborhood Polygon data (1)
+
+This dataset contains location data for all the neighborhoods in LA. It contains
+the name and multipolygon data for each of the 99 neighborhoods in LA.
+
+-LA Neighborhood Areal Census Data (2)
+
+This dataset contains 2010 census data associated with the neighborhoods in LA.
+The variables include: Total population. Number of people who identified as
+White, Black, Native American, Asian, Hawaiian, Multiracial, or Other.
+Number of Renter Occupied Households. Number of Owner Occupied Households.
+
+-LA Zoning Polygon data (3)
+
+This dataset contains location data for all zones in LA. It contains the zoning
+code and multipolygon data for each zoning location in LA.
+
+-LA Zoning code reference data (4)
+
+This dataset is a lookup table for the zoning codes that are given as 
+part of the Zoning polygon dataset, these can be used to see what type of
+zoning the code corresponds to using publically available LA zoning 
+regulations (6).
+
+-LA school location data (5)
+
+This dataset contains loication for all schools within LA including
+latitude and longititude as well as enrollment where available.
+
+### School Accessability Definition
+
+To preform the analysis outlined, We must define a neighborhood level school accessibility metric; 
+however, we only have access to school point data, areal neighborhood data, and zoning
+data (including residential zoning). Therefore, we propose defining an 
+accessibility metric based on average distance to the nearest school from any
+location within a residential zoned area. We will be define the school 
+accessibility metric as follows:
+
+Let $S = \{s_1, s_2, ..., s_n\}$ be the set of schools in LA where $s_i = (x_i, y_i)$
+is the coordinates of the school in the UTM zone 10N (CRS 32610). Let $N \subset \mathbb{R}^2$
+be the set of all points within a particular neighborhood and $R \subset \mathbb{R}^2$ be 
+the set of all points that are residentially zoned within LA. For any point $p \in N \cap R$ (in UTM zone 10N)
+the distance to the closest school is $d(p, S) = \min_{s \in S}||p - s||$. The school
+accessibility metric (SAM) for neighborhood $N$ is then defined as the expected distance from a point $p$ chosen
+uniformally at random from $N \cap R$, to the closest school. Formally, we can 
+write this as $\text{SAM}(N) = \mathbb{E}[d(p, S)] = \frac{1}{\text{Area}(N \cap R)} \int_{N \cap R} d(p, S) dp$. Intuitively, we can think of this as the average distance from any residentially zoned point within a
+neighborhood to the closest school; this means that the value of the school accessibility metric
+is in meters and that **a higher value represents lower accessibility**.
+
+Using this definition, we can also come up with an approximation of the true
+value for $\text{SAM}(N)$ for a given neighborhood by defining a grid of
+points over the neighborhood with small vertical and horizontal spacing between
+the grid points. We can then calculate $d(p, S)$ for each point in the grid
+and find the mean between all grid points that are within residential zones. 
+With sufficiently small spacing between grid points, this method will approximate the value of
+$\text{SAM}(N)$. This approximation process was used to find the school accessibility metric for 
+each of the neighborhoods.
+
+### Data Cleaning and Processing
+
+To preform the analysis of school accessibility across LA, the five data sets
+described in the data acquisition section had to be cleaned and combined and
+the school accessibility metric for each neighborhood had to be calculated.
+
+First, the  Neighborhood areal data containing 99 neighbourhoods was joined with the 
+Neighborhood demographic data resulting in a data set of neighborhoods that contain demographic information 
+about each neighborhood. Four of the neighborhoods did not have any corresponding demographic data,
+resulting in NA values for all of the demographic variables; these neighborhoods were
+not removed as they could still be used in the hotspot analysis, but would be removed when preforming
+the regression analysis. The neighborhood data was projected to UTM zone 10N.
+
+The school data was cleaned by removing non-public
+schools from the dataset, as the project concerns school accessibility it does
+not make sense to consider private schools as these schools are not necessarily
+accessible to families even if they live close to them. The school data was
+projected to UTM zone 10N.
+
+Both the zoning multipolygon data and the zoning reference table were loaded and joined.
+The zoning data was then filtered to keep only regions that are zoned for residential
+use according to their zone class which was referenced against a publically available
+table found online (6). The remaining data points corresponded to
+multipolygon regions that are zoned for residential use. The zoning data
+was projected to UTM zone 10N.
+
+Next, the school accessibility metric was calculated
+for each neighborhood. To calculate this metric, a grid of points (in UTM zone 10N coordinates) 
+that span the entire LA region with 100 meter spacing between the points was created. For each point in the
+grid the euclidean distance to the closest school from that point was calculated (note that the closest school does not have to be in the same neighborhood). A spatial
+join was used to find all of the grid data points that were within residentially zoned neighborhoods,
+all other grid points were discarded. Another spatial join was used between the remaining grid
+points and the neighborhoods to find which neighborhood the grid points were contained in. 
+Finally, the grid points distance to closest school were averaged per neighborhood to 
+approximate the school accessibility metric per neighborhood.
+
+After the data cleaning, we were left with one dataset that contained each of the
+neighborhoods, with demographic information and the calculated school accessibility
+metric per neighborhood.
+
+### Data Exploration
+
+For the initial data exploration. A summary of the demographic variables was 
+created by creating a table containing each of the mean of each of the demographic variables.
+Additionally, leaflet maps were produced visualizing the demographic 
+variables grouped by neighborhood. These demographics included total populations,
+populations by race, and renter/owner occupied households. The maps were visually
+assessed for any general trends or clusters in demographics.
+
+Next, a leaflet map were produced visualizing the distribution of schools throughout
+LA. Additionally, a heat map of distance to the closest school was produced in leaflet
+by plotting the grid points described in the data cleaning and processing section. For
+the purpose of visualization only, the grid spacing was changed to 1km as leaflet was
+slow in processing the number of points generated with 100m spacing. This change
+was only made for visualization, the school accessibility metric per neighborhood
+was still calculated with 100m grid spacing. Finally, a 
+leaflet map of school accessibility by neighborhood was produced by plotting
+the school accessibility metrics calculated in the data cleaning and processing section. 
+The map was visually assessed for trends or clusters in school accessibility.
+
+Before, creating the leaflet maps, all data was projected into WGS 84.
+
+### Hotspot Analysis
+
+A hostspot analysis was conducted to identify whether school accessibility by
+neighborhood was spatially autocorrellated and to identify clusters of low
+and high school accessibility.
+
+First, an appropriate adjacency matrix had to be chosen to define adjacent
+neighborhoods. Six adjacency matrices were considered: Queen, Rook, 2NN, 4NN,
+6NN, and 8NN. Queen and Rook are contiguity based adjacency, defining adjacent
+neighborhoods by regions sharing a boundary only for Rook, and a boundary or corner 
+for Queen. In comparison, KNN are distance based, defining adjacent neighborhoods
+by the K-closest neighborhoods based on distance between neighborhood centroids.
+For this analysis, emphasis on local relationships is desirable to identify 
+small clusters within LA where school accessibility is low or high. With emphasis
+on local patterns in mind, correlograms of neighborhood school accessibility metrics 
+were plotted using each of the six adjacency matrices. 
+The correlograms shows Moran I values, which measures how correlated the school accessibility 
+is, for different lags based on the adjacency matrix. For local patterns, we want
+to observe large Moran I for small lags and Moran I values near zero for larger lags
+which would represent strong correlation for immediate neighbors that diminishes as
+we go further to the neighbors of those neighbors. 
+
+```{r}
+par(mfrow = c(2, 3), mar=c(5, 4, 5, 2)+0.1)  # Arrange plots
+
+plot(moran_queen, main = "Queen Contiguity")
+plot(moran_rook, main = "Rook Contiguity")
+plot(moran_knn2, main = "KNN (k=2)")
+plot(moran_knn4, main = "KNN (k=4)")
+plot(moran_knn6, main = "KNN (k=6)")
+plot(moran_knn8, main = "KNN (k=8)")
+mtext("Figure 1. Adjacency Matrix Correlogram Comparison", side = 3, line = -1.5, outer = TRUE)
+```
+
+Figure 1 shows the correlograms of the six tested adjacency matrices. As discussed,
+for emphasis on local patterns we want to see large Moran I for small lags that
+quickly declines to 0, we see this in the 2NN correlogram where the Moran I starts
+high for lag 1, but decreases such that the confidence interval contains zero for
+lags greater than 1. We do see that the Moran I appears to become significant
+again at lag 6 however the 2NN adjacency still emphasizes
+local clustering the most out of the adjacency matrices as the others show
+large Moran's I for lags > 1. Therefore, 2NN adjacency weights were chosen
+for the hotspot analysis.
+
+Next, the data was tested for spatial autocorrelation in the school accessibility
+metric across all neighborhoods using a Global Moran's I test. A Moran's I test
+using Markov Chain Monte Carlo (MCMC) simulation was preformed. The null hypothesis of
+this test is that there is no spatial autocorrelation in the data, while the
+alternative hypothesis is that there is. In the MCMC test, the null distribution
+is created by randomly permuting the data such that observations of the school
+accessibility metric are assigned at random between the neighborhoods, a Moran's
+I value is then calculated for the randomized data, and the process is repeated
+for a large number of simulations to form an empirical distribution under
+randomization. 999 simulations were chosen to provide a large number of simulation to 
+form null distribution while maintaining reasonable computation time. 
+Finally, the observed Moran's I for the data can be compared to the null distribution created through randomization, and a p-value can be calculated. MCMC simulation was chosen due to relying on weaker assumptions; 
+compared to the theoretical Moran's I calculation, the MCMC
+approach does not rely on the assumption of normality under the null hypothesis
+making it more robust. The approach does assume spatial stationary,
+meaning any mean trend in the school accessibility metric was removed and 
+the spatial pattern is represented in the weights.
+
+After testing for spatial autocorrelation using Global Moran's I test, 
+local Moran's I was used to identify clusters of neighborhoods
+with low school accessibility. Local Moran's I tests for spatial autocorrelation
+at local scale and identifies clusters of high school accessibility metric neighborhoods
+adjacent to other high school accessibility neighborhoods called high-high clusters, and
+also identifies low-low clusters, high-low clusters, and low-high clusters, where neighborhoods
+are considered adjacent based on the chosen adjacency matrix. Similar to
+the global Moran I, the null distribution was generated by randomization
+weakening the assumption of normality under the null hypothesis. However, 
+local Moran I also assumes spatial stationary and is sensitive to the chosen
+adjacency weight matrix. Z-scores for local Moran I for neighborhoods were calculated and plotted, 
+and neighborhoods with significantly non-zero (p<0.05) Moran I value where highlighted on the plot after
+applying Bonferroni correction for multiple hypothesis testing. 
+
+Finally, hotspots of high neighborhood school accessibility metrics
+were identified using Getis-Ord G\*. Getis-Ord G\* is used to identify
+clusters of high or low school accessibility metric neighborhoods called hotspots
+or coldspots; however, unlike local Moran's I, G\* identifies specific neighborhoods
+where school accessibility are significantly higher or lower than expected. A high
+G\* value for a neighborhood indicates that neighborhood and its neighbors have
+high school accessibility metrics while a low G\* indicates that neighborhood and
+its neighbors have a low school accessibility metric. As with the Local Moran's I,
+the null distribution was generated by randomization and G\* values where 
+normalized to z-scores. Spatial stationary is still assumed making the
+test sensitive to the choice of adjacency matrix. Z-scores for each neighborhood were 
+plotted and neighborhoods with significantly non-zero (p<0.05) G\* value where 
+highlighted on the plot after applying Bonferroni correction for multiple hypothesis testing.
+
+### Regression Analysis
+
+Following the hotspot analysis, a regression analysis was conducted to model
+neighborhood school accessibility using the demographic variables: "Total Population", "White Population","Black Population", "Native American Population", "Asian Population", "Hawaiian Population", "Multiracial Population", "Other Population", "Owner Occupied Households", "Renter Occupied Households". To conduct this analysis, 
+an ordinary least squares (OLS), simultaneous autoregressive (SAR), and conditional autoregressive (CAR) models
+were fit.
+
+First, an OLS model was fit using neighborhood school accessibility metric as the dependent variable
+and the demographic variables described above as independent variables. The OLS model is a linear regression model fitting the relationship between the dependent and independent variables. The model assumes a linear relationship between these variables and incorporates no spatial information, so the relationship is assumed to be the same across all neighborhoods. Additionally, OLS model assumes that model residuals are not correlated. Summary tables were produced for the model coefficients, $R^2$, AIC, and RMSE. A plot of model residuals by neighborhood was produced and Moran's I test was used to assess whether spatial autocorrelation was present in residuals. A significant Moran I statistic for the residual test indicates that there is spatial autocorrelation present in the residuals indicating the model did not properly account for spatial patterns, and indicates the non-correlated error assumption of OLS was violated. Whether the assumption of non-correlated error is violated, the OLS model was used to provide a comparison point for the more sophisticated SAR and CAR models which account for spatial structure in the data.
+
+Next, a SAR error model was fit using neighborhood school accessibility metric as the dependent variable and the demographic variables described above as independent variables. As with the hotspot analysis, 2NN adjacency weights were used for fitting this model. Similar to the OLS model, the SAR model fits a linear relationship between the dependent and independent variables; however, the SAR error model assumes that the error term for a neighborhood is related to adjacent neighborhoods (defined by the adjacency matrix used) rather than independent as in the linear model. Coefficients are fit using maximum likelihood estimation that incorporates the spatially correlated error term to account for spatial autocorrelation. As with the OLS model, the SAR model assumes a linear relationship between the dependent and independent variable but also assumes that errors are spatially correlated between neighbors such that the error in one neighborhood depends on the error in adjacent neighborhoods. Summary tables were produced for the model coefficients, AIC, RMSE, and likelihood ratio test statistic. A plot of model residuals by neighborhood was produced and Moran's I test was used to assess whether spatial autocorrelation was present in the residuals. A significant Moran I statistic indicates that the SAR error model did not properly account for spatial autocorrelation. The Moran I statistic and residual plot was compared to the OLS model to identify if the SAR error model improved on the OLS model.
+
+Finally, a CAR model was fit using neighborhood school accessibility metric as the dependent variable and the demographic variables described above as independent variables. 2NN adjacency weights were used for fitting this model. The model fits the relationship between the school accessibility metric and the independent variables in a neighborhood accounting for the conditionally dependency between adjacent neighborhoods. This means that the model assumes that the value for school accessibility metric for a neighborhood conditionally depends on the value for all its neighbors defined by the adjacency matrix. Coefficients are fit using maximum likelihood estimation that spatial correlation between adjacent neighborhoods. The CAR model assumes a linear relationship between the dependent and independent variable but also assumes that the error term is conditionally dependent on error term of adjacent neighborhoods. Summary tables were produced for the model coefficients, AIC, RMSE, and likelihood ratio test statistic. A plot of model residuals by neighborhood was produced and Moran's I test was used to assess whether spatial autocorrelation was present in the residuals. A significant Moran I statistic indicates the CAR model did not properly account for spatial autocorrelation. The Moran I statistic and residual plot was compared to both the OLS and SAR error models to identify if the CAR model improved on either.
+
+The coefficients of all three models were compared to assess how changes in demographic variables of the neighborhoods affected the school accessibility metric of that neighborhood. Conclusions were made using the coefficients of the models that had non-significant Moran I values indicating they properly modeled the spatial structure of the data.
+
+## Results
+
+The results section includes subsections corresponding to the initial analysis where plots where
+produced and analyzed, the hotspot analysis subsection where neighborhood clusters were examined, and
+the regression analysis section where regression was preformed using neighborhood demographic information.
+
+### Preliminary Analysis
+
+```{r}
+mean_demo <- demographics %>%
+  select(-NC_Name, -Hispanic_pop, -In_Poverty) %>%
+  colMeans()
+mean_demo <- round(mean_demo)
+names(mean_demo) <- c("Total Population", "White Population","Black Population", "Native American Population", "Asian Population", "Hawaiian Population", "Multiracial Population", "Other Population", "Owner Occupied Households", "Renter Occupied Households")
+mean_demo <- as.data.frame(mean_demo)
+colnames(mean_demo) <- c("Mean")
+
+mean_demo %>%
+  kable(caption="Table 1. Demographic Variable Means")
+
+```
+
+Table 1 summarizes the mean of each of the neighbourhood demographic variables. 
+We can see that on average the largest demographic for race across the neighbourhoods
+was white people with the Native American and Hawaiian population average being very low across
+the neighbourhoods. We also see that the average number of owner occupied households was
+lower than the average number of renter occupied households across the neighbourhoods 
+implying that renting tends to be more common across the neighborhoods in LA.
+
+### **Figure 2.** Demographic Quantiles By Neighbourhood
+
+```{r}
+pop_palette <- colorQuantile("YlGnBu", nb$Total.Population, n = 5)
+w_pop_palette <- colorQuantile("YlGnBu", nb$White_pop, n = 5)
+b_pop_palette <- colorQuantile("YlGnBu", nb$Black_pop, n = 5)
+na_pop_palette <- colorQuantile("YlGnBu", nb$Ameri_es_pop, n = 5)
+a_pop_palette <- colorQuantile("YlGnBu", nb$Asian_pop, n = 5)
+h_pop_palette <- colorQuantile("YlGnBu", nb$Hawn_pi_pop, n = 5)
+mr_pop_palette <- colorQuantile("YlGnBu", nb$Multi_pop, n = 5)
+o_pop_palette <- colorQuantile("YlGnBu", nb$Other_pop, n = 5)
+rent_palette <- colorQuantile("YlGnBu", nb$Renter_occ, n = 5)
+own_palette <- colorQuantile("YlGnBu", nb$Owner_occ, n = 5)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 2. Demographic Quantiles by Neighbourhood")
+)  
+
+leaflet(nb) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pop_palette(Total.Population),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " Total Population: ", Total.Population),
+    group = "Total Population"
+  ) %>%
+  addPolygons(
+    fillColor = ~w_pop_palette(White_pop),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " White Population: ", White_pop),
+    group = "White Population"
+  ) %>%
+  addPolygons(
+    fillColor = ~b_pop_palette(Black_pop),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " Black Population: ", Black_pop),
+    group = "Black Population"
+  ) %>%
+  addPolygons(
+    fillColor = ~a_pop_palette(Asian_pop),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " Asian Population: ", Asian_pop),
+    group = "Asian Population"
+  ) %>%
+  addPolygons(
+    fillColor = ~rent_palette(Renter_occ),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " Renter Occuppied Households: ", Renter_occ),
+    group = "Renter Occupied Homes"
+  ) %>%
+  addPolygons(
+    fillColor = ~own_palette(Owner_occ),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1,
+    label = ~paste("Name: ", name, " Owner Occuppied Households: ", Owner_occ),
+    group = "Owner Occupied Homes"
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pop_palette,
+    values = ~Total.Population,
+    title = "Quantiles",
+    opacity = 0.7,
+  ) %>%
+  addLayersControl(
+    baseGroups = c("Total Population", "White Population", "Black Population", "Asian Population", "Renter Occupied Homes", "Owner Occupied Homes"),
+    options = layersControlOptions(collapsed = FALSE),
+    position = "topleft"
+  ) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 2 shows the quantile demographics of the neighborhoods for 
+Total Population, White Population, Black Population, and Asian Population 
+(the three largest groups in the dataset) as well as the number of owner occupied household 
+and number of renter occupied households by neighborhood. We can see that there are some noticeable differences 
+in population by neighborhood between the groups. Neighborhoods to the north 
+(generally suburban neighborhoods) tended to have higher quantile
+populations of white people while neighborhoods southwest of downtown tended
+to have higher quantile populations of black people. Both Neighborhoods to the 
+northwest (directly east of Thousand oaks) and north east (near Glendale) of 
+downtown tended to have higher quantile populations of Asian people. Overall,
+we see some neighborhoods that have high quantile populations in all groups,
+such as NC Westchester/Playa, and we also see some neighborhoods and groups
+of neighborhoods with large differences between the groups. Additionally, We see 
+that neighborhoods closer to downtown tend to be in higher quantiles of renter 
+occupied households while more suburban areas tend to be in the lower quantiles. 
+This trend is reversed for the quantiles of owner occupied houses by neighborhood. 
+This is generally expected as we would likely see higher rates of renting in more dense 
+areas due to more apartments or higher prices while suburban areas would likely have higher ownership rates.
+This data will be useful to see whether poor school accessibility disproportionately impacts any
+of these groups, and will be used in the regression analysis. 
+We also see that four neighborhoods do not have any corresponding
+demographic data and are marked as NA on the map; due to the missing demographic
+data, these neighborhoods were excluded from the regression analysis preformed
+later in this report.
+
+### **Figure 3.** School Locations
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+schools_wsg <- st_transform(schools, crs=4326)
+
+school_palette <- colorFactor(c('#4E79A7', '#F28E2B', '#E15759', '#76B7B2'), nb$Category2)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 3. School Locations")
+)  
+
+leaflet(schools_wsg) %>%
+  addTiles() %>%
+  addCircles(
+    color= ~school_palette(Category2), 
+    fillOpacity=1, 
+    opacity=1, 
+    radius=10,
+    label = ~paste0("Name: ", Name, ", Enrollment: ", Enrollment)
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = school_palette,
+    values = ~Category2,
+    title = "School Type",
+    opacity = 0.7,
+  ) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 3 shows all schools in LA by school type. We can see that there are 
+a very large number of schools. From visual inspection, the schools do appear
+to have  large coverage of all neighborhoods indicating many
+of these neighborhoods could have schools within walking distance of residential
+areas. However, many of these schools are outside the neighborhoods we can
+see in the demographics map (although this doesn't mean people in those
+neighborhoods cannot go to schools outside their neighborhood).
+
+### **Figure 4.** Distance to Closest School
+
+```{r}
+# school heatmap
+grid_pal <- colorNumeric(palette = "YlOrRd", domain = grid1_sf$distance)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 4. Distance to Closest School")
+)  
+
+leaflet(grid1_sf) %>%
+  addTiles() %>%
+  addCircles(
+    color= ~grid_pal(distance), 
+    fillOpacity=0.8, 
+    opacity=1, 
+    radius=1,
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = grid_pal,
+    values = ~distance,
+    title = "Distance to School (m)",
+    opacity = 0.7,
+  ) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 4 shows a heat map of distance to the nearest school. The value
+at a point represents the distance from that point to the nearest school. Note
+that the spacing used in this map is 1km between grid points rather than 100m
+as described in the data cleaning and processing section. From this map
+we can see locations of very low school accessibility near long beach, west Hollywood,
+and towards the northwest near thousand oaks. We generally see a trend of 
+suburban areas having lower school accessibility compared to the urban downtown
+area, this generally makes sense as we would expect densely populated areas to
+have a higher density of schools resulting in more schools being within close
+distance.
+
+### **Figure 5.** School Accessability by Neighbourhood
+
+```{r}
+# map of average distances
+
+dist_pal <- colorNumeric(palette = "YlOrRd", domain = nb_dists$avg_dist)
+walk_pal = colorFactor(c('green','white'), levels=c("TRUE","FALSE"))
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 5. School Accessability by Neighbourhood")
+)  
+
+leaflet(nb_dists) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~dist_pal(avg_dist),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = dist_pal,
+    values = ~avg_dist,
+    title = "School Accessability Metric (m)",
+    opacity = 0.7,
+  ) %>%
+  addPolygons(color = ~walk_pal(walkable), fill=F, weight=1)%>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 5 shows the school accessibility metric by neighborhood. Neighbourhoods
+with a school accessability metric less than 1km are considered "walkable" and are
+highlighted in green. Similar
+to the heat map, we see that more suburban areas tend to have a larger school
+accessibility metric meaning that these people in these neighborhoods would have
+to travel further to get to school. In comparison, urban areas tended to have
+lower school accessibility metrics meaning better accessibility. This makes
+sense as we would expect densely populated areas to have more schools within
+smaller distances. We also can visually identify some potential clusters of
+low accessibility neighborhoods such as the strip of neighborhoods above
+west Hollywood. Similarly, their appears to be a cluster of high accessibility
+neighborhoods near downtown. This visual inspection showed preliminary
+evidence of clustering, which was be further explored in the hotspot analysis.
+
+### Hotspot Analysis
+
+```{r}
+set.seed(1)
+moran_mc <- moran.mc(data$avg_dist, knn2_weights, nsim = 999)
+table <- data.frame(c(moran_mc$statistic, moran_mc$p.value))
+rownames(table) <- c("Moran I", "P-Value")
+table %>% 
+  kable(caption="Table 2. Global Moran I using MCMC simulation", col.names=NULL)
+```
+
+Table 2 shows the result of the MCMC simulated global Moran's I test using 2NN adjacency. 
+The Moran I statistic was 0.4653455 (p<0.01) indicating strong evidence of positive spatial
+autocorrelation in school accessibility metric between neighborhoods. This means that
+the school accessibility metric in neighborhoods are similar to the school accessibility
+metric in neighborhoods close to that neighborhood as defined by the 2NN adjacency.
+
+```{r}
+plot(moran_mc, main = "Figure 6: Moran's I with MCMC Simulation (2NN Weights)", xlab="Moran I")
+```
+
+Figure 6 shows the null distribution created by the MCMC simulation with the 
+observed Moran I marked as the black line. We can see from this distribution that
+the observed Moran I is very significant, being placed far in the positive tail
+of the null distribution. This figure again shows that there is strong evidence
+of spatial autocorrelation of school accessibility between neighborhoods.
+
+### **Figure 7.** Neighbourhood Local Moran's I
+
+```{r}
+# local Moran's I
+loc_moran <- localmoran(data$avg_dist,knn4_weights, alternative="two.sided")
+
+data$Ii <- loc_moran[,1]
+data$p.value <- p.adjust(loc_moran[,5], method="bonferroni")
+data$significant <- data$p.value <= 0.05
+
+# map pallettes
+clust.pal <- colorFactor(palette = c("blue", "lightblue", "lightpink","red"),
+                  domain=attributes(loc_moran)$quadr$mean)
+sig.pal = colorFactor(c('green','white'), levels=c("TRUE","FALSE"))
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 7. Local Moran I Neighbourhoods")
+)  
+
+# map
+leaflet(data) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(fillColor = ~clust.pal(attributes(loc_moran)$quadr$mean), 
+              color = "black", weight = 1, opacity = 1, fillOpacity = 0.7,
+              label = ~paste0("LocalI: ", round(Ii,2), " Neighbourhood: ", name, " School Accessability Metric: ", avg_dist),
+              highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9)) %>%
+  addPolygons(color = ~sig.pal(significant), fill=F, weight=2)%>%
+  leaflet::addLegend(pal = clust.pal, values = ~attributes(loc_moran)$quadr$mean, title = "Local Moran's I", opacity = 0.7) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 7 shows the neighborhood z-scores of local Moran I statistics. Neighborhoods
+with significant Moran I statistic after applying Bonferonni correction are highlighted
+in green. Neighborhoods labeled High-High indicate neighborhoods with high school accessibility metric surrounded by other neighborhoods with high school accessibility metric. Neighborhoods labeled Low-Low indicate neighborhoods with low school accessibility metric surrounded by other neighborhoods of low school accessibility metric. Neighborhoods labeled Low-High or High-Low indicate neighborhoods with low/high school accessibility metric surrounded by other neighborhoods of high/low school accessibility metric, respectively. We see two large clusters of high-high and low-low neighborhoods. The high-high cluster appears in the neighborhoods north towards the suburbs while the low-low cluster appears downtown. This highlights the suburban/urban divide in school accessibility where suburban areas tend to have much lower school accessibility than urban areas. This is expected as we would imagine that urban areas have higher density of schools due to higher population density. However, we do not see any neighborhoods with statistically significant Moran I. Overall, the clusters seem to reflect suburban versus urban areas of LA, highlighting how urban areas tend to have better school accessibility, however these differences are not statistically significant.
+
+### **Figure 8.** Neighbourhood Getis Ord G\*
+
+```{r}
+# local getis-ord g*
+loc_g <- localG(data$avg_dist, knn4_weights, alternative="two.sided")
+
+data$Gi <- attributes(loc_g)$internals[,1]
+data$Z.Gi <- attributes(loc_g)$internals[,4] 
+data$p.value <- p.adjust(attributes(loc_g)$internals[,5], method="bonferroni")
+data$significant <- data$p.value <= 0.05
+
+# map pallettes
+gstar.pal <- colorNumeric(palette = "RdBu", domain = data$Z.Gi, reverse=TRUE)
+sig.pal = colorFactor(c('green','white'), levels=c("TRUE","FALSE"))
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 8. Getis-Ord G* Neighbourhoods")
+)  
+
+#map
+leaflet(data) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+   addPolygons(fillColor = ~gstar.pal(data$Z.Gi), 
+              color = "black", weight = 1, opacity = 1, fillOpacity = 0.7,
+              label = ~paste0("LocalG: ", round(Z.Gi,2), " Neighbourhood: ", name, " School Accessability Metric: ", avg_dist),
+              highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9)) %>%
+  addPolygons(color = ~sig.pal(significant), fill=F, weight=2)%>%
+  leaflet::addLegend(pal = gstar.pal, values = ~data$Z.Gi, title = "Getis-Ord", opacity = 0.7) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Figure 8 shows the neighborhood z-scores of Getis-Ord G\* statistics. Neighborhoods
+with significant G\* after applying Bonferonni correction are highlighted
+in green. Neighborhoods with high z-score indicate neighborhoods with high school accessibility metric that are surrounded by other high school accessibility metric neighborhoods. While neighborhoods with lower z-score indicate neighborhoods with low school accessibility metric surrounded by other low school accessibility metric neighborhoods. We see a cluster of low G\* neighborhoods in downtown LA while we see a cluster of high G\* neighborhoods towards the northwest. This plot again shows a suburban/urban divide between school accessibility where suburban areas tend to have lower school accessibility and be surrounded by neighborhoods with lower school accessibility while urban areas tend to have higher school accessibility and be surrounded by other neighborhoods with higher school accessibility. However, we do not see any neighborhoods with statistically significant G\*, indicating this trend of suburban/urban divide in school accessibility is not statistically significant. Overall, the plot shows limited evidence of hotspots of low/high accessibility generally reflecting a suburban/urban areas.
+
+We can conclude from this hotspot analysis that there is some evidence of clustering in school accessibility between neighborhoods. We generally see this clustering reflect the trend of suburban areas having lower school accessibility than the urban downtown areas. This intuitively makes sense as we would expect higher school density in higher population density areas. We would also expect suburban areas to have lower school accessibility due to most land being dedicated to single family housing and the overall navigability of suburban areas tending to be low compared to downtown urban areas.
+
+### Regression Analysis
+
+```{r}
+data <- data %>%
+  drop_na(Total.Population)
+coords <- st_coordinates(st_centroid(st_geometry(data)))
+knn2_neighbors <- knn2nb(knearneigh(coords, k = 2))
+knn2_weights <- nb2listw(knn2_neighbors, style = "W", zero.policy=TRUE)
+```
+
+```{r}
+# lm 
+lm <- lm(avg_dist ~ Total.Population + White_pop + Black_pop + Ameri_es_pop + Asian_pop + Hawn_pi_pop + Other_pop + Multi_pop + Owner_occ + Renter_occ, data=data)
+
+s <- summary(lm)
+t <- data.frame(c(s$adj.r.squared, AIC(lm), sqrt(mean(lm$residuals^2))))
+colnames(t) <- NULL
+rownames(t) <- c('Adj R-Squared', 'AIC', 'RMSE')
+c <- s$coef
+rownames(c) <- c("Intercept", "Total Population", "White Population", "Black Population", "Native American Population", "Asian Population", "Haiwaiin Population", "Other Population", "Multiracial Population", "Owner Occupied Homes", "Renter Occupied Homes")
+kable(list(c, t), caption="Table 3. OLS Summary")
+```
+
+Table 3 shows a summary of OLS coefficients with their significance, as well as
+OLS adjusted r-squared, AIC, and RMSE. We see from the adjusted r-squared that the
+model was only able to account for 48% of the variability in school accessibility
+metric using the independent variables. The model also had large RMSE of 323,
+for school accessibility metric which is measured in meters, which implies the
+model had high error. The coefficient estimates can be interpreted as the change
+in school accessibility metric per 1 unit increase in the independent variable
+holding all other variables constant; for example, the total population estimate
+can be interpreted as the school accessibility metric of a neighborhood decreasing
+by 0.0089918 m when we add a single person to the total population of that neighborhood
+holding all other variables constant. However, only the white population independent
+variable was significant at p < 0.01 indicating strong evidence of the true coefficient
+being non-zero. The native american population, multiracial population, and owner occupied
+households estimates were significant at p < 0.1 indicating weak evidence that their true coefficients are
+non-zero. All other coefficient estimates were non-significant at p > 0.1. Comparing 
+these estimates to the demographic map shown in Figure 2, we can see that white people
+tended to have higher population in the suburban areas that had lower school accessibility 
+in the school accessibility map shown in Figure 5. A similar trend can be observed
+for owner occupied households. Therefore, it is likely that
+whether a neighborhood is a suburban or urban area is a confounding variable
+between white population and school accessibility metric. Overall, the model
+had high error and most coefficient estimates were insignificant, showing that
+neighborhood demographics were not particularly predictive of school accessibility.
+
+```{r}
+data$lm_residual <- residuals(lm) 
+moran_lm <- moran.test(data$lm_residual, knn2_weights)
+
+t <- data.frame(c(moran_lm$statistic, moran_lm$p.value))
+colnames(t) <- NULL
+rownames(t) <- c('Moran I', 'P-Value')
+
+t %>%
+  kable(caption="Table 4. OLS Residual Moran I Test Summary")
+
+```
+
+### **Figure 9.** OLS Residuals
+
+```{r}
+# map pallettes
+lm.pal <- colorNumeric(palette = "RdBu", domain = data$lm_residual, reverse=TRUE)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 9. OLS Residuals")
+)  
+
+#map
+leaflet(data) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+   addPolygons(fillColor = ~lm.pal(data$lm_residual), 
+              color = "black", weight = 1, opacity = 1, fillOpacity = 0.7,
+              label = ~paste0("Residual: ", round(lm_residual,2), " Neighbourhood: ", name, " School Accessability Metric: ", avg_dist),
+              highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9)) %>%
+  leaflet::addLegend(pal = lm.pal, values = ~data$lm_residual, title = "OLS Residual", opacity = 0.7) %>%
+  addControl(title, position = "topleft", className="map-title")
+
+```
+
+Table 4 shows the result of the Moran I test on OLS residuals using 2NN adjacency.
+The Moran I statistic was 2.2337515 (p<0.05) indicating evidence of positive spatial 
+autocorellation in the residuals of neighborhoods. This means that the residuals of
+neighborhoods were similar to the residual in neighborhoods close to that neighborhood
+as defined by the 2NN adjacency. This also indicates that the OLS model did not
+account for spatial autocorrelation in residuals and that a different model such 
+as SAR or CAR model would be more appropriate. Figure 9 shows a plot of the
+residuals by neighborhood. From visual inspection we can see what appears to
+be clusters of low and high residuals near downtown and towards the northwest
+further indicating that this model did not account of spatial correlation in residuals.
+While the presence of spatial correlation in residuals indicate that the assumptions
+for OLS were violated, this model and the residual map provide a good comparison
+point for the following SAR and CAR models.
+
+```{r}
+# sar error
+sar_error <- errorsarlm(avg_dist ~ Total.Population + White_pop + Black_pop + Ameri_es_pop + Asian_pop + Hawn_pi_pop + Other_pop + Multi_pop + Owner_occ + Renter_occ, data=data, listw=knn2_weights)
+
+s <- summary(sar_error)
+t <- data.frame(c(5.2835, 0.02153, 1396.3, sqrt(mean(s$residuals^2))))
+colnames(t) <- NULL
+rownames(t) <- c('LR Test Stat', 'LR Test P-value', 'AIC', 'RMSE')
+c <- s$Coef
+rownames(c) <- c("Intercept", "Total Population", "White Population", "Black Population", "Native American Population", "Asian Population", "Haiwaiin Population", "Other Population", "Multiracial Population", "Owner Occupied Homes", "Renter Occupied Homes")
+kable(list(c, t), caption="Table 5. SAR Summary")
+```
+
+Table 5 shows a summary of SAR error coefficients with their significance, as well as
+SAR error Likelihood Ratio test statistic, Likelihood Ratio test p-value, AIC, and RMSE.
+The likelihood ratio test statistic was significant (p < 0.05) indicating that 
+including the spatial autocorrelation in the error term significantly improved
+model fit. We see that the SAR error model had slightly higher AIC but lower RMSE indicating it 
+preformed very similarly to the OLS model. The coefficient estimates can be 
+interpreted as the change in school accessibility metric per 1 unit increase in the independent variable
+holding all other variables and the spatially correlated error term constant; for example, the total population estimate can be interpreted as the school accessibility metric of a neighborhood decreasing
+by 0.0082621 m when we add a single person to the total population of that neighborhood
+holding all other variables and spatial error constant. Only the owner occupied household
+variable was significant at p < 0.1 indicating weak evidence that the true coefficient
+was non-zero. All other coefficient estimates were non-significant at p > 0.1. 
+Similar to the reasoning described for the OLS coefficient for white population,
+if we compare to the demographic map in Figure 2 we can see that their tended
+to be a higher number of owner occupied household in suburban areas and those areas 
+tended to have lower school accessibility as shown in Figure 5. Therefore,
+it is likely that whether a neighborhood is suburban or urban is a confounding
+variable between owner occupied household and the school accessibility metric. Overall,
+the SAR model had similarly high RMSE and AIC to the OLS model and none of the
+coefficients were significant at p < 0.05, showing that neighborhood
+demographics were not particularly predictive of school accessibility.
+
+```{r}
+data$sar_error_residual <- residuals(sar_error)
+moran_sar <- moran.test(data$sar_error_residual, knn2_weights)
+
+t <- data.frame(c(moran_sar$statistic, moran_sar$p.value))
+colnames(t) <- NULL
+rownames(t) <- c('Moran I', 'P-Value')
+
+t %>%
+  kable(caption="Table 6. SAR Residual Moran I Test Summary")
+```
+
+### **Figure 10.** SAR Residuals
+
+```{r}
+# map pallettes
+sar.pal <- colorNumeric(palette = "RdBu", domain = data$sar_error_residual, reverse=TRUE)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 10. SAR Residuals")
+)  
+
+#map
+leaflet(data) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+   addPolygons(fillColor = ~sar.pal(data$sar_error_residual), 
+              color = "black", weight = 1, opacity = 1, fillOpacity = 0.7,
+              label = ~paste0("Residual: ", round(sar_error_residual,2), " Neighbourhood: ", name, " School Accessability Metric: ", avg_dist),
+              highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9)) %>%
+  leaflet::addLegend(pal = sar.pal, values = ~data$sar_error_residual, title = "SAR Residual", opacity = 0.7) %>%
+  addControl(title, position = "topleft", className="map-title")
+```
+
+Table 6 shows the result of the Moran I test on SAR residuals using 2NN adjacency.
+The Moran I statistic was 0.2793124 (p>0.1) indicating no evidence of positive spatial 
+autocorellation in the residuals of neighborhoods. This indicates that the SAR model was able to
+account for spatial autocorrelation in residuals unlike the OLS model. Figure 10 shows a plot of the
+residuals by neighborhood. From visual inspection we can see there may
+be small clusters of low and high residuals near downtown and towards the northwest
+although these appear slightly less clear than in the OLS model residuals, although
+the residual map looks quite similar overall. The Moran I test and residual map
+indicate that the SAR error model was able to properly account for spatial autocorrelation
+in the residuals.
+
+```{r}
+# car model
+car <- spautolm(avg_dist ~ Total.Population + White_pop + Black_pop + Ameri_es_pop + Asian_pop + Hawn_pi_pop + Other_pop + Multi_pop + Owner_occ + Renter_occ, data=data, listw=knn2_weights, family = "CAR")
+
+s <- summary(car)
+t <- data.frame(c(1.9743, 0.15999, 1399.6, sqrt(mean(residuals(car)^2))))
+colnames(t) <- NULL
+rownames(t) <- c('LR Test Stat', 'LR Test P-value', 'AIC', 'RMSE')
+c <- s$Coef
+rownames(c) <- c("Intercept", "Total Population", "White Population", "Black Population", "Native American Population", "Asian Population", "Haiwaiin Population", "Other Population", "Multiracial Population", "Owner Occupied Homes", "Renter Occupied Homes")
+kable(list(c, t), caption="Table 7. CAR Summary")
+```
+
+Table 7 shows a summary of CAR error coefficients with their significance, as well
+as CAR error likelihood ratio test statistic, likelihood ratio test p-value, AIC, and RMSE.
+The likelihood ratio test statistic was not significant at p > 0.10 indicating that
+the inclusion of spatial dependence did not significantly improve model fit.
+We see that the CAR error model had similar AIC to the OLS and SAR model and RMSE between
+the OLS and SAR models indicating it the model preformed similarly to the OLS and
+SAR models. The coefficient estimates can be interpreted as the change in school accessibility
+metric per 1 unit increase in the independent variable holding all other variables
+and spatial effect constant; for example, the total population estimate can be interpreted as the school accessibility metric of a neighborhood decreasing
+by 0.0037204 m when we add a single person to the total population of that neighborhood
+holding all other variables and spatial effect constant. The white population 
+and native american population coefficient estimates where significant at p < 0.05
+indicating evidence that their true coefficients are non-zero. Multiracial
+population coefficient estimate was significant at p < 0.1 indicating weak
+evidence that its true coefficient is non-zero. Similar to the OLS and SAR
+model, it is likely that whether a neighborhood was suburban or urban 
+acts as a confounding variable between school accessibility metric and
+white, native american, and multiracial populations. Overall, 
+the CAR model had similarly large RMSE and AIC to the OLS and SAR models. 
+Only a few of the coefficients estimates were significant, showing that
+neighborhood demographics were not particularly predictive of school accessibility.
+
+```{r}
+data$car_residual <- residuals(car)
+moran_car <- moran.test(data$car_residual, knn2_weights)
+
+t <- data.frame(c(moran_car$statistic, moran_car$p.value))
+colnames(t) <- NULL
+rownames(t) <- c('Moran I', 'P-Value')
+
+t %>%
+  kable(caption="Table 8. CAR Residual Moran I Test Summary")
+```
+
+### **Figure 11.** CAR Residuals
+
+```{r}
+# map pallettes
+car.pal <- colorNumeric(palette = "RdBu", domain = data$car_residual, reverse=TRUE)
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+"))
+
+title <- tags$div(
+  tag.map.title, HTML("Figure 11. CAR Residuals")
+)  
+
+#map
+leaflet(data) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+   addPolygons(fillColor = ~car.pal(data$car_residual), 
+              color = "black", weight = 1, opacity = 1, fillOpacity = 0.7,
+              label = ~paste0("Residual: ", round(car_residual,2), " Neighbourhood: ", name, " School Accessability Metric: ", avg_dist),
+              highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9)) %>%
+  leaflet::addLegend(pal = car.pal, values = ~data$car_residual, title = "CAR Residual", opacity = 0.7) %>%
+  addControl(title, position = "topleft", className="map-title")
+
+```
+
+Table 8 shows the result of the Moran I test on CAR residuals using 2NN adjacency.
+The Moran I statistic was 0.3289856 (p>0.1) indicating no evidence of positive spatial 
+autocorellation in the residuals of neighborhoods. This indicates that the CAR model was able to
+account for spatial autocorrelation in residuals unlike the OLS model. Figure 11 shows a plot of the
+residuals by neighborhood. From visual inspection we can see there may
+be small clusters of low and high residuals near downtown and towards the northwest
+although these appear slightly less clear than in the OLS model residuals, although
+the residual map looks quite similar to the SAR and OLS models. The Moran I test and residual map
+indicate that the CAR model was able to properly account for spatial autocorrelation
+in the residuals.
+
+Concluding the regression analysis, we can see that both the SAR error and CAR
+models were able to account for spatial autocorrelation in residuals while
+the OLS model could not. We see that for the OLS and CAR models, the coefficient
+for white population was significantly positive showing that neighborhoods
+with higher populations of white people tended to have higher school accessibility
+metrics indicating lower school accessibility. The OLS and CAR models showed
+significantly positive and negative coefficient estimates for Native American 
+and multiracial populations respectively, although these demographic populations 
+were very low throughout all neighborhoods compared to all other demographic populations, 
+potentially biasing results. The SAR model only showed significant coefficient for
+the owner occupied households variable. While these results could indicate a trend of 
+neighborhoods with higher white and native american populations or more owner occupied households 
+having lower school accessibility, it is also likely that whether a neighborhood is
+suburban or urban acts as a confounding variable as evidenced in the demographic
+map in figure 2 and the school accessibility metric by neighborhood in figure 5.
+This observation does raise the question of why suburban neighborhoods tend
+to have a larger white population, various socioeconomic factors could influence
+this such as housing prices in these areas and relative levels of income for the white
+population compared to other demographics, however this question is largely out of the scope of this analysis.
+For all three models, we see that the demographic variables used were not
+very predictive of school accessibility suggesting that none of the demographics
+(except possibly white, native american, and multiracial people) were disproportionately
+impacted by low school accessibility.
+
+## Conclusion
+
+The preliminary analysis showed evidence of different demographics of people
+tending to live in different neighborhoods of LA, such as suburban areas in 
+the north west having higher population of white people compared to other
+areas shown in figure 2. We also saw evidence of suburban neighborhoods
+in the northwest having lower school accessibility than urban neighborhoods
+near downtown LA in figure 5. These observations were further confirmed by
+the hotspot analysis which showed clusters of high and low school accessibility
+that tended to correspond to urban and suburban areas respectively. Finally,
+the regression analysis compared school accessibility across the different
+demographic variables but showed little evidence that any of the demographics
+were disproportionately impacted by low school accessibility. The only neighborhood 
+demographics that showed evidence of being predictive of low school accessibility
+were white population and native american population, although whether the
+neighborhood was suburban could have acted as a confounding variable in this
+relationship. Overall, this analysis highlights a suburban versus urban divide
+in school accessibility, where suburban areas tended to have much lower school
+accessibility than urban ones. 
+
+The lack of school accessibility in suburban areas
+could impact community connection and environmental sustainability, increasing
+traffic congestion or negatively impact child well being
+as children are isolated from community spaces such as schools. Therefore,
+it would be beneficial to increase the amount of schools in these areas or
+add viable public transit options. While suburban locations may
+be desirable for individuals or families, their lack of school accessibility
+appears to be the unfortunate trade off for larger homes or quieter neighborhoods.
+By addressing these gaps in school or transportation infrastructure, communities 
+can create more inclusive and sustainable suburban environments that prioritize education, 
+connectivity, and overall well-being for residents.
+
+## Limitations
+
+This analysis has important limitations to consider. First, the school
+accessibility metric was defined based on euclidean distance to the 
+closest school. While this allowed simple computation, a person travelling
+to that school would have to travel along roads or pedestrian paths which
+could alter the true distance they have to travel. A future analysis could
+instead use a network based distance by incorporating road or pedestrian
+path data when calculating the school accessibility metric. Additionally,
+the demographic data used in the regression analysis was limited to only
+simple population counts and renter/owner occupied households, incorporating
+more economic data such as neighborhood median income or 
+household value could provide more meaningful insight into how equitable
+school accessibility is across neighborhoods. Finally, the school accessibility
+metric does not take into account whether a point in a residential area is likely
+to be a "starting point" for travelling to a school; for example, it could be the
+case that certain residential areas do not have any families with children who
+would be attending a school making the distance to the closest school less relevant
+for this area. Future analysis could attempt to weight the importance of school 
+accessibility differently for different areas. 
+
+## Refrences
+
+(1) https://data.lacity.org/A-Well-Run-City/Neighborhoods/ykhe-zspy 
+
+(2) https://data.lacity.org/Community-Economic-Development/Census-Data-by-Neighborhood-Council/nwj3-ufba/about_data 
+
+(3) https://data.lacity.org/Housing-and-Real-Estate/Zoning/rryw-49uv 
+
+(4) https://data.lacity.org/Housing-and-Real-Estate/Zoning-Reference-Table/ikdx-vgub/about_data 
+
+(5) https://geohub.lacity.org/datasets/32331535785b405d869ca7a7aa3abb1f_0/explore?location=34.010881%2C-118.243830%2C10.91  
+
+(6) https://planning.lacity.gov/odocument/eadcb225-a16b-4ce6-bc94-c915408c2b04/Zoning_Code_Summary.pdf
